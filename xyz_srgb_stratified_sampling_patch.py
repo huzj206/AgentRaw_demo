@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-XYZ + sRGB patch-level stratified sampling (ReRAW-style)
+XYZ + sRGB patch-level stratified sampling (Stage A, sRGB -> XYZ)
 
-完全参考 ReRAW 的 stratified_sampling.py:
-
-- dataset["root"], ["rgb_path"], ["raw_path"]
-- cfg_sample["output_folder_root"], ["sample_path"], ["target_path"], ["context_path"]
-- 使用 sRGB 图像做亮度分层（/256，等宽 bin）
-- 保存:
-    sample_path: sRGB patch (模型输入)
-    target_path: XYZ patch (模型输出 / GT)
-    context_path: sRGB context patch
-
-注意:
-    raw_path 这里放的是 XYZ .npy (H, W, 3)，不是 Bayer RAW。
+- 完全借鉴 ReRAW 的分层采样机制，但不再为 patch 多加 1 像素边界
+- 输入：
+    * sRGB 图像：dataset["root"] / dataset["rgb_path"]
+    * XYZ 图像：dataset["root"] / dataset["raw_path"]，格式为 .npy, shape=(H, W, 3)
+- 亮度分层：
+    * 用 sRGB 图像做亮度分层（/256，等宽 bin）
+- 输出：
+    * sample_path : sRGB patch (模型输入)，形状 (sample_size[0], sample_size[1], 3)
+    * target_path : XYZ patch (模型输出 / GT), 同大小
+    * context_path: sRGB context patch，用 large_crop 生成 (context_size, context_size, 3)
 """
 
 import cv2
@@ -25,7 +23,7 @@ import multiprocessing
 from tqdm import tqdm
 import argparse
 
-from resources.utils import large_crop  # 与 ReRAW 一样复用 large_crop
+from resources.utils import large_crop  # 复用 ReRAW 的 large_crop
 
 
 def sample_from_image(
@@ -37,11 +35,11 @@ def sample_from_image(
     cfg_sample,
 ):
     """
-    对单张 {sRGB, XYZ} 图做 ReRAW 风格的分层 patch 采样。
+    对单张 {sRGB, XYZ} 图做分层 patch 采样。
 
     file_name: 不含扩展名的 base name
     rgb_path : sRGB 图目录
-    raw_path : XYZ .npy 目录（替代 ReRAW 的 RAW）
+    raw_path : XYZ .npy 目录
     """
 
     # 输出目录 (字段名和 ReRAW 完全一致)
@@ -51,14 +49,16 @@ def sample_from_image(
     context_path = os.path.join(output_root, cfg_sample["context_path"]) # sRGB context
 
     n_samples = cfg_sample["samples_per_channel"]
+    patch_h, patch_w = cfg_sample["sample_size"]
+    delta = cfg_sample["delta"]
 
-    # 读 sRGB (和 ReRAW 一样，作为亮度分层的基础)
+    # 读 sRGB (作为亮度分层的基础)
     rgb_file = os.path.join(rgb_path, f"{file_name}.{rgb_extension}")
     if not os.path.exists(rgb_file):
         print(f"[WARN] RGB file not found, skip: {rgb_file}")
         return
 
-    if rgb_extension in ["jpg", "JPG", "jpeg", "png"]:
+    if rgb_extension in ["jpg", "JPG", "jpeg", "png", "PNG"]:
         rgb_img = cv2.imread(rgb_file)
         rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB).astype(np.float32)
     elif rgb_extension == "npy":
@@ -85,9 +85,9 @@ def sample_from_image(
 
     img_h, img_w = rgb_img.shape[:2]
 
-    # 和 ReRAW 一样的网格计算
-    count_h = (img_h - cfg_sample["sample_size"][0]) // cfg_sample["delta"]
-    count_w = (img_w - cfg_sample["sample_size"][1]) // cfg_sample["delta"]
+    # 网格计算：和 ReRAW 一样
+    count_h = (img_h - patch_h) // delta
+    count_w = (img_w - patch_w) // delta
 
     if count_h <= 2 or count_w <= 2:
         print(
@@ -101,18 +101,18 @@ def sample_from_image(
     # 亮度计算：完全照抄 ReRAW，只是变量名 rgb_img
     for i in range(1, count_h - 1):
         for j in range(1, count_w - 1):
-            y = cfg_sample["sample_size"][0] + i * cfg_sample["delta"]
-            x = cfg_sample["sample_size"][1] + j * cfg_sample["delta"]
+            y = patch_h + i * delta
+            x = patch_w + j * delta
             for c in range(3):
                 patch = rgb_img[
-                    y - cfg_sample["sample_size"][0] // 2 : y + cfg_sample["sample_size"][0] // 2,
-                    x - cfg_sample["sample_size"][1] // 2 : x + cfg_sample["sample_size"][1] // 2,
+                    y - patch_h // 2 : y + patch_h // 2,
+                    x - patch_w // 2 : x + patch_w // 2,
                     c,
                 ]
                 brightness = np.mean(patch) / 256.0
                 bright[i, j, c] = brightness
 
-    # 等宽 [0,1] bin，和 ReRAW 一致
+    # 等宽 [0,1] bin
     bins = np.linspace(0, 1, cfg_sample["n_bins"] + 1)
     counter = 0
 
@@ -122,19 +122,18 @@ def sample_from_image(
         # 只用 1..n_bins-1（最亮一档没用到，保持和 ReRAW 一致）
         locations = [np.where(idx == i) for i in range(1, cfg_sample["n_bins"])]
 
-        # ReRAW 代码里 prob/sample_indexes 基本没用，这里也照搬
         prob = [int(len(loc) > 0) for loc in locations]
         if np.sum(prob) > 0:
             prob = [p / np.sum(prob) for p in prob]
-        sampled_indexes = [x for x in range(len(prob))]
+        sampled_indexes = [x for x in range(len(prob))]  # 保留形式，与原版一致（虽然没用）
 
-        for i_sample in range(n_samples):
+        for _ in range(n_samples):
             if cfg_sample["type"] == "random":
-                # 完全随机选网格点（ReRAW 的 random 分支）
+                # 完全随机选网格点
                 y = np.random.randint(1, count_h - 1)
                 x = np.random.randint(1, count_w - 1)
             else:
-                # stratified 分支：先随机选 bin，再在 bin 内选位置
+                # stratified：先随机选 bin，再在 bin 内选位置
                 try:
                     sampled_index = np.random.randint(cfg_sample["n_bins"])
                     sampled_location = np.random.randint(
@@ -147,17 +146,18 @@ def sample_from_image(
                     y = np.random.randint(1, count_h - 1)
                     x = np.random.randint(1, count_w - 1)
 
-            # 从网格坐标到像素坐标（完全照抄 ReRAW）
-            y1 = np.clip(y * cfg_sample["delta"], 2, None)
-            y2 = np.clip(y1 + cfg_sample["sample_size"][0], None, img_h - 2)
+            # 从网格坐标到像素坐标
+            y1 = np.clip(y * delta, 0, img_h - patch_h)
+            y2 = y1 + patch_h
 
-            x1 = np.clip(x * cfg_sample["delta"], 2, None)
-            x2 = np.clip(x1 + cfg_sample["sample_size"][1], None, img_w - 2)
+            x1 = np.clip(x * delta, 0, img_w - patch_w)
+            x2 = x1 + patch_w
 
-            # sRGB patch（上下左右各留 1 px，作为网络输入）
-            selected_patch_rgb = rgb_img[y1 - 1 : y2 + 1, x1 - 1 : x2 + 1]
+            # sRGB patch：不再额外留边界，直接 sample_size × sample_size
+            selected_patch_rgb = rgb_img[y1:y2, x1:x2]      # (patch_h, patch_w, 3)
             # 同位置 XYZ patch（网络 GT）
-            selected_patch_xyz = xyz_img[y1 - 1 : y2 + 1, x1 - 1 : x2 + 1]
+            selected_patch_xyz = xyz_img[y1:y2, x1:x2]      # (patch_h, patch_w, 3)
+
             # context：使用 large_crop 基于 sRGB
             context = large_crop(
                 rgb_img,
@@ -167,17 +167,14 @@ def sample_from_image(
             )
 
             # === 保存 patch ===
-            # sample_path: sRGB (输入)
             np.save(
                 os.path.join(sample_path, f"{file_name}_{counter}.npy"),
                 selected_patch_rgb,
             )
-            # target_path: XYZ (GT)
             np.save(
                 os.path.join(target_path, f"{file_name}_{counter}.npy"),
                 selected_patch_xyz,
             )
-            # context_path: sRGB context
             np.save(
                 os.path.join(context_path, f"{file_name}_{counter}.npy"),
                 context,
@@ -188,7 +185,7 @@ def sample_from_image(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Perform stratified sampling for sRGB->XYZ patches (ReRAW-style)."
+        description="Perform stratified sampling for sRGB->XYZ patches (Stage A)."
     )
     parser.add_argument("-c", "--cfg", type=str, default="", help="Config path.")
     parser.add_argument("-n", "--n", type=int, default=2, help="number of workers")
@@ -233,7 +230,7 @@ if __name__ == "__main__":
     for folder in [sample_path, target_path, context_path]:
         os.makedirs(folder, exist_ok=True)
 
-    print("=== StageA sRGB->XYZ Patch Stratified Sampling (ReRAW-style) ===")
+    print("=== StageA sRGB->XYZ Patch Stratified Sampling ===")
     print(f"RGB root : {rgb_path} (*.{rgb_extension})")
     print(f"RAW/XYZ  : {raw_path} (*.{raw_extension})")
     print(f"Output   : {output_root}")
@@ -247,7 +244,7 @@ if __name__ == "__main__":
     print(f"samples_per_channel: {cfg_sample['samples_per_channel']}")
     print("===============================================")
 
-    # 和 ReRAW 一样：用 rgb 文件名作为基准
+    # 用 rgb 文件名作为基准
     file_names = [f.split(".")[0] for f in rgb_files]
 
     tasks = [
@@ -266,4 +263,3 @@ if __name__ == "__main__":
 
         pool.close()
         pool.join()
-
